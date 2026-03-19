@@ -1,0 +1,126 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Intake Dashboard</title>
+  <style>
+    :root { --bg:#0b1020; --panel:#131a2f; --border:#26304d; --muted:#96a0be; --text:#edf2ff; --blue:#7aa2ff; --green:#7ee787; --yellow:#f2cc60; }
+    *{box-sizing:border-box} body{margin:0;font-family:Inter,system-ui,sans-serif;background:var(--bg);color:var(--text)}
+    .wrap{display:grid;grid-template-columns:300px 1fr 420px;min-height:100vh}
+    .panel{padding:18px;border-right:1px solid var(--border);overflow:auto}.panel:last-child{border-right:0}
+    .card{background:var(--panel);border:1px solid var(--border);border-radius:18px;padding:16px;margin-bottom:14px}
+    button{border:0;border-radius:12px;padding:10px 14px;background:var(--blue);color:#061226;font-weight:700;cursor:pointer}
+    button.secondary{background:#1b2441;color:var(--text);border:1px solid var(--border)} button[disabled]{opacity:.5;cursor:not-allowed}
+    input,textarea,select{width:100%;background:#0d1430;color:var(--text);border:1px solid var(--border);border-radius:12px;padding:10px}
+    textarea{min-height:86px;resize:vertical}
+    .brand{font-size:1.05rem;font-weight:700}.muted{color:var(--muted);font-size:.9rem}.grid{display:grid;gap:10px}
+    .ticket{padding:12px;border:1px solid var(--border);border-radius:16px;background:#10162a;cursor:pointer}.ticket.active{border-color:var(--blue)}
+    .chat{display:grid;gap:10px;max-height:300px;overflow:auto;margin:12px 0}.msg{padding:10px 12px;border:1px solid var(--border);border-radius:14px;background:#10162a}
+    .msg-role{font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:4px}
+    .pill{display:inline-block;border:1px solid var(--border);border-radius:999px;padding:5px 10px;font-size:.8rem;color:var(--muted)}
+    .kv{display:grid;grid-template-columns:130px 1fr;gap:10px;margin-bottom:10px;font-size:.92rem}
+    .empty{padding:24px;border:1px dashed var(--border);border-radius:16px;color:var(--muted);text-align:center}
+    pre{white-space:pre-wrap;word-break:break-word;background:#0a0f24;border:1px solid var(--border);border-radius:12px;padding:12px;max-height:220px;overflow:auto}
+    .inline{display:flex;gap:10px}.inline>*{flex:1}
+    @media (max-width:1200px){.wrap{grid-template-columns:1fr}.panel{border-right:0;border-bottom:1px solid var(--border)}}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <section class="panel">
+    <div class="card">
+      <div class="brand">Intake Dashboard</div>
+      <div class="muted">Front-end form guide + backend authority.</div>
+    </div>
+    <div class="card grid">
+      <input id="phoneInput" placeholder="Optional customer phone" />
+      <select id="channelInput"><option value="phone">phone</option><option value="sms">sms</option><option value="web">web</option></select>
+      <button id="newSessionBtn">Create session</button>
+      <button id="refreshBtn" class="secondary">Refresh tickets</button>
+    </div>
+    <div id="ticketList" class="grid"></div>
+  </section>
+  <section class="panel">
+    <div class="card">
+      <div class="brand">Transcript</div>
+      <div id="sessionMeta" class="muted">Create or select a session.</div>
+      <div id="chatPane" class="chat"></div>
+      <div class="grid">
+        <textarea id="turnInput" placeholder="Type the next customer reply"></textarea>
+        <div class="inline"><button id="sendTurnBtn" disabled>Send turn</button><button id="submitBtn" disabled>Submit to OpenClaw</button></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="brand">Draft propose</div>
+      <div class="muted">Paste a messy utterance. The backend will validate what it accepts.</div>
+      <div class="grid" style="margin-top:10px">
+        <textarea id="draftInput" placeholder="hi this is jack my number is 415... i need tire exchange today"></textarea>
+        <div class="inline"><button id="analyzeBtn" class="secondary" disabled>Analyze</button><button id="applyDraftBtn" disabled>Apply</button></div>
+      </div>
+      <pre id="candidatePane">No draft analyzed yet.</pre>
+    </div>
+  </section>
+  <section class="panel">
+    <div class="card">
+      <div class="brand">Conversation contract</div>
+      <div class="muted">This is what a phone/SMS front end should follow.</div>
+      <div id="contractPane" class="empty">No session selected.</div>
+    </div>
+    <div class="card">
+      <div class="brand">Ticket detail</div>
+      <div id="detailPane" class="empty">No ticket selected yet.</div>
+    </div>
+  </section>
+</div>
+<script>
+const ticketList = document.getElementById('ticketList');
+const sessionMeta = document.getElementById('sessionMeta');
+const chatPane = document.getElementById('chatPane');
+const detailPane = document.getElementById('detailPane');
+const contractPane = document.getElementById('contractPane');
+const phoneInput = document.getElementById('phoneInput');
+const channelInput = document.getElementById('channelInput');
+const newSessionBtn = document.getElementById('newSessionBtn');
+const refreshBtn = document.getElementById('refreshBtn');
+const turnInput = document.getElementById('turnInput');
+const sendTurnBtn = document.getElementById('sendTurnBtn');
+const submitBtn = document.getElementById('submitBtn');
+const draftInput = document.getElementById('draftInput');
+const analyzeBtn = document.getElementById('analyzeBtn');
+const applyDraftBtn = document.getElementById('applyDraftBtn');
+const candidatePane = document.getElementById('candidatePane');
+let tickets=[]; let selectedTicketId=null; let currentSessionId=null; let currentSession=null; let latestCandidate=null;
+function escapeHtml(str){return String(str||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;');}
+async function fetchJson(url, options={}){const res = await fetch(url, options); if(!res.ok) throw new Error(await res.text()||res.status); const type=res.headers.get('content-type')||''; return type.includes('application/json') ? res.json() : {};}
+function prettyDate(value){ try{return new Date(value).toLocaleString();}catch{return value||'—';}}
+function renderTickets(){ if(!tickets.length){ticketList.innerHTML='<div class="empty">No tickets yet.</div>'; return;} ticketList.innerHTML=tickets.map(t=>`<div class="ticket ${selectedTicketId===t.ticket_id?'active':''}" data-ticket-id="${t.ticket_id}" data-session-id="${t.session_id}"><div><strong>${escapeHtml(t.customer_name||'Unknown customer')}</strong></div><div class="muted">${escapeHtml(t.status)} • ${escapeHtml(t.service||'—')} • ${escapeHtml(t.preferred_time||'—')}</div><div class="muted">${prettyDate(t.updated_at)}</div></div>`).join(''); document.querySelectorAll('[data-ticket-id]').forEach(node=>node.addEventListener('click', async ()=>{selectedTicketId=node.dataset.ticketId; currentSessionId=node.dataset.sessionId; renderTickets(); await loadDetail(); await loadSession();})); }
+function renderTranscript(transcript){ if(!transcript?.length){ chatPane.innerHTML='<div class="empty">No transcript yet.</div>'; return;} chatPane.innerHTML=transcript.map(msg=>`<div class="msg"><div class="msg-role">${escapeHtml(msg.role)}</div><div>${escapeHtml(msg.content)}</div></div>`).join(''); chatPane.scrollTop = chatPane.scrollHeight; }
+function renderContract(contract){ if(!contract){ contractPane.innerHTML='<div class="empty">No session selected.</div>'; return; } contractPane.innerHTML = `
+  <div class="kv"><div>State</div><div>${escapeHtml(contract.state)}</div></div>
+  <div class="kv"><div>Current field</div><div>${escapeHtml(contract.current_field || '—')}</div></div>
+  <div class="kv"><div>Prompt ID</div><div>${escapeHtml(contract.prompt_id)}</div></div>
+  <div class="kv"><div>Audio ID</div><div>${escapeHtml(contract.play_audio_id || '—')}</div></div>
+  <div class="kv"><div>Missing</div><div>${escapeHtml((contract.missing_fields || []).join(', ') || 'none')}</div></div>
+  <div class="kv"><div>Allow submit</div><div>${contract.allow_submit ? 'yes' : 'no'}</div></div>
+  <div class="kv"><div>Next prompt</div><div>${escapeHtml(contract.next_prompt)}</div></div>
+  <div class="kv"><div>Channel switch</div><div>${escapeHtml(contract.suggested_channel_switch || '—')}</div></div>
+  <div class="muted">Draft form</div>
+  <pre>${escapeHtml(JSON.stringify(contract.draft_form, null, 2))}</pre>`;
+  submitBtn.disabled = !contract.allow_submit;
+}
+function renderDetail(detail){ if(!detail){ detailPane.innerHTML='<div class="empty">No ticket selected yet.</div>'; return;} detailPane.innerHTML = `<div class="kv"><div>Session</div><div>${escapeHtml(detail.session_id)}</div></div><div class="kv"><div>Status</div><div>${escapeHtml(detail.ticket.status)}</div></div><div class="kv"><div>Customer</div><div>${escapeHtml(detail.ticket.customer.name || '—')}</div></div><div class="kv"><div>Phone</div><div>${escapeHtml(detail.ticket.customer.phone || '—')}</div></div><div class="kv"><div>Service</div><div>${escapeHtml(detail.ticket.request.service || '—')}</div></div><div class="kv"><div>Preferred time</div><div>${escapeHtml(detail.ticket.request.preferred_time || '—')}</div></div><div class="kv"><div>Notes</div><div>${escapeHtml(detail.ticket.request.notes || '—')}</div></div><div class="kv"><div>OpenClaw</div><div>${detail.submitted_to_openclaw ? 'submitted' : 'not submitted'}</div></div><pre>${escapeHtml(JSON.stringify(detail.openclaw_response || {message:'No OpenClaw response yet.'}, null, 2))}</pre>`; }
+async function loadTickets(){ tickets = await fetchJson('/tickets'); renderTickets(); }
+async function loadDetail(){ if(!selectedTicketId) return; const detail = await fetchJson(`/tickets/${selectedTicketId}`); renderDetail(detail); }
+async function loadSession(){ if(!currentSessionId) return; currentSession = await fetchJson(`/sessions/${currentSessionId}`); sessionMeta.textContent = `Session ${currentSession.session_id} • channel ${currentSession.ticket.channel}`; renderTranscript(currentSession.transcript); renderContract(currentSession.contract); analyzeBtn.disabled = false; sendTurnBtn.disabled = false; }
+newSessionBtn.addEventListener('click', async ()=>{ const body = { phone: phoneInput.value.trim() || null, channel: channelInput.value }; const session = await fetchJson('/sessions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}); currentSessionId = session.session_id; selectedTicketId = session.ticket.ticket_id; await loadTickets(); currentSession = session; sessionMeta.textContent = `Session ${session.session_id} • channel ${session.ticket.channel}`; renderTranscript(session.transcript); renderContract(session.contract); renderDetail({session_id:session.session_id, ticket:session.ticket, submitted_to_openclaw:false, openclaw_response:null}); analyzeBtn.disabled = false; sendTurnBtn.disabled = false; });
+refreshBtn.addEventListener('click', async ()=>{ await loadTickets(); if(currentSessionId){ await loadSession(); await loadDetail(); }});
+sendTurnBtn.addEventListener('click', async ()=>{ if(!currentSessionId || !turnInput.value.trim()) return; const session = await fetchJson(`/sessions/${currentSessionId}/turn`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({user_input:turnInput.value})}); turnInput.value=''; currentSession = session; renderTranscript(session.transcript); renderContract(session.contract); await loadTickets(); await loadDetail(); });
+analyzeBtn.addEventListener('click', async ()=>{ if(!currentSessionId || !draftInput.value.trim()) return; latestCandidate = await fetchJson(`/sessions/${currentSessionId}/suggest`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text:draftInput.value})}); candidatePane.textContent = JSON.stringify(latestCandidate, null, 2); applyDraftBtn.disabled = false; });
+applyDraftBtn.addEventListener('click', async ()=>{ if(!currentSessionId || !latestCandidate) return; const c = latestCandidate.candidate_fields || {}; const session = await fetchJson(`/sessions/${currentSessionId}/propose`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({...c, source:'frontend_ai', raw_text:latestCandidate.source_text, auto_advance:true})}); currentSession = session; renderContract(session.contract); await loadSession(); await loadTickets(); await loadDetail(); });
+submitBtn.addEventListener('click', async ()=>{ if(!currentSessionId) return; const session = await fetchJson(`/sessions/${currentSessionId}/submit`, {method:'POST'}); currentSession = session; renderTranscript(session.transcript); renderContract(session.contract); await loadTickets(); await loadDetail(); });
+loadTickets();
+</script>
+</body>
+</html>
