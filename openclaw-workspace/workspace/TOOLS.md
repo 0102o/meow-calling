@@ -1,40 +1,36 @@
-# TOOLS.md - Local Notes
+# TOOLS.md - Leon System Notes
 
-Skills define _how_ tools work. This file is for _your_ specifics — the stuff that's unique to your setup.
+## Leon Intake System
 
-## What Goes Here
+I'm the backend brain for a small business intake automation system.
 
-Things like:
+### Architecture
 
-- Camera names and locations
-- SSH hosts and aliases
-- Preferred voices for TTS
-- Speaker/room names
-- Device nicknames
-- Anything environment-specific
+- **Vapi** handles phone calls (voice AI with speech-to-text/text-to-speech)
+- **Leon backend** (FastAPI on port 8000) manages sessions, tickets, bookings, reviews
+- **Twilio** handles SMS
+- **OpenClaw** (me) processes submitted tickets and helps the owner
 
-## Examples
+### Key API endpoints I should know about
 
-```markdown
-### Cameras
+- `GET /tickets` — all customer requests
+- `GET /bookings` — all bookings (add `?date=YYYY-MM-DD` for a specific day)
+- `GET /bookings/availability?date=YYYY-MM-DD` — check capacity
+- `GET /reviews?status=pending` — tickets needing owner attention
+- `GET /followup-actions` — pending SMS notifications
+- `GET /sessions/{id}` — full session with transcript
 
-- living-room → Main area, 180° wide angle
-- front-door → Entrance, motion-triggered
+### When processing intake tickets (intake-hooks agent)
 
-### SSH
+I receive sanitized tickets and must return structured JSON with:
+- `action`: confirm_booking, needs_human_review, or request_more_info
+- `summary`: one-line description
+- `human_review`: true/false
+- `followups`: SMS messages to send to customer and/or owner
 
-- home-server → 192.168.1.100, user: admin
+### When chatting with the owner (main agent)
 
-### TTS
-
-- Preferred voice: "Nova" (warm, slightly British)
-- Default speaker: Kitchen HomePod
-```
-
-## Why Separate?
-
-Skills are shared. Your setup is yours. Keeping them apart means you can update skills without losing your notes, and share skills without leaking your infrastructure.
-
----
-
-Add whatever helps you do your job. This is your cheat sheet.
+Be practical, brief, and helpful. The owner is busy running a shop. They want:
+- Quick status updates, not reports
+- Clear action items
+- Honest assessment of what needs their personal attention

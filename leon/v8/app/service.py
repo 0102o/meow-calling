@@ -1,14 +1,17 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
 from fastapi import HTTPException
 
+logger = logging.getLogger("intake.service")
+
 from .config import Settings
 from .database import SessionRepository
-from .extraction import extract_candidate_fields, sanitize_notes
+from .extraction import extract_candidate_fields, extract_phone, sanitize_notes
 from .models import (
     CandidateFields,
     ConversationContract,
@@ -17,11 +20,13 @@ from .models import (
     IntakeSession,
     ProposeTicketRequest,
     ProposeTicketResponse,
+    ReviewItem,
     SessionState,
     SuggestFromTextResponse,
     TelephonyEvent,
 )
-from .openclaw_adapter import submit_ticket
+from .calendar import check_availability, create_booking_from_session
+from .openclaw_adapter import parse_openclaw_response, submit_ticket
 from .state_machine import IntakeStateMachine, PROMPT_LIBRARY
 
 
@@ -42,6 +47,7 @@ class IntakeService:
         session.transcript.append(ConversationMessage(role="assistant", content=message))
         session.touch()
         self.repository.save_session(session)
+        logger.info("Session started: %s channel=%s phone=%s", session.session_id, channel, phone or "none")
         return session
 
     def get_session_or_404(self, session_id: str) -> IntakeSession:
@@ -83,11 +89,44 @@ class IntakeService:
 
     async def process_turn(self, session_id: str, user_input: str) -> IntakeSession:
         session = self.get_session_or_404(session_id)
+        prev_state = session.state
         session.transcript.append(ConversationMessage(role="user", content=user_input))
-        message = self.state_machine.handle_turn(session, user_input)
+
+        message = None
+        used_llm = False
+
+        # LLM path: only for collection states
+        if self.settings.llm_active and session.state not in {
+            SessionState.CONFIRMATION,
+            SessionState.CORRECTION,
+            SessionState.SUBMITTED,
+        }:
+            from .llm import call_gemini
+
+            missing = self.state_machine.missing_fields(session.ticket)
+            llm_result = await call_gemini(session, user_input, missing, self.settings)
+            if llm_result is not None:
+                # Always extract phone via regex
+                regex_phone = extract_phone(user_input)
+                if regex_phone and not session.ticket.customer.phone:
+                    session.ticket.customer.phone = regex_phone
+                # Apply validated LLM fields
+                self._apply_llm_fields(session, llm_result.extracted_fields)
+                # State machine resolves next state
+                session.state = self.state_machine.resolve_state(session)
+                session.touch()
+                # Use LLM reply with sanity check
+                message = self._sanitize_llm_reply(llm_result.reply, session)
+                used_llm = message is not None
+
+        if message is None:
+            # Fallback: existing regex + fixed prompt path
+            message = self.state_machine.handle_turn(session, user_input)
+
         session.last_assistant_message = message
         session.transcript.append(ConversationMessage(role="assistant", content=message))
         self.repository.save_session(session)
+        logger.info("Turn processed: %s %s->%s llm=%s", session_id, prev_state.value, session.state.value, used_llm)
         return session
 
     def suggest_from_text(self, session_id: str, text: str) -> SuggestFromTextResponse:
@@ -146,6 +185,7 @@ class IntakeService:
             self.repository.save_session(session)
             return session, "Ticket was already submitted to OpenClaw."
 
+        logger.info("Submitting ticket %s to OpenClaw for session %s", session.ticket.ticket_id, session_id)
         submission_result = await submit_ticket(session.ticket, self.settings)
         session.submitted_to_openclaw = submission_result.submitted
         session.openclaw_response = submission_result.response
@@ -156,18 +196,112 @@ class IntakeService:
         session.transcript.append(
             ConversationMessage(
                 role="system",
-                content=f"OpenClaw submission result: {session.openclaw_response or {'status': 'local_only'}}",
+                content=f"OpenClaw submission result: {submission_result.submitted}",
             )
         )
         session.transcript.append(ConversationMessage(role="assistant", content=session.last_assistant_message))
         session.touch()
         self.repository.save_session(session)
+
         if submission_result.submitted:
+            logger.info("Ticket %s submitted to OpenClaw successfully", session.ticket.ticket_id)
+            # Create a booking from the ticket
+            booking = create_booking_from_session(session, self.repository)
+            if booking:
+                session.transcript.append(
+                    ConversationMessage(role="system", content=f"Booking created: {booking.booking_id} on {booking.booking_date}")
+                )
+            # Parse OpenClaw response and create follow-up actions
+            await self._handle_openclaw_response(session)
             return session, "Ticket submitted to OpenClaw."
+        logger.warning("Ticket %s not submitted to OpenClaw: %s", session.ticket.ticket_id, submission_result.response)
         return session, "OpenClaw disabled; ticket confirmed locally."
+
+    async def _handle_openclaw_response(self, session: IntakeSession) -> None:
+        """Parse OpenClaw's response and execute follow-up actions."""
+        parsed = parse_openclaw_response(session.openclaw_response)
+        if not parsed:
+            logger.warning("Could not parse OpenClaw response for session %s", session.session_id)
+            return
+
+        ticket = session.ticket
+        from .sms_sender import send_sms
+
+        logger.info("OpenClaw action=%s review=%s followups=%d", parsed.action, parsed.human_review_needed, len(parsed.followups))
+
+        # Execute structured followups from OpenClaw
+        for followup in parsed.followups:
+            if followup.type == "notify_owner" and self.settings.owner_phone and self.settings.owner_notifications_enabled:
+                action = FollowupAction(
+                    session_id=session.session_id,
+                    ticket_id=ticket.ticket_id,
+                    action_type="notify_owner",
+                    channel="sms",
+                    destination=self.settings.owner_phone,
+                    reason="OpenClaw: owner notification",
+                    payload={"suggested_message": followup.message},
+                )
+                self.repository.save_followup_action(action)
+                result = await send_sms(self.settings.owner_phone, followup.message, self.settings)
+                self.repository.update_followup_action_status(action.action_id, "sent" if result.sent else "pending")
+                logger.info("Owner notify: %s status=%s", action.action_id, "sent" if result.sent else "pending")
+
+            elif followup.type == "sms_customer" and ticket.customer.phone:
+                action = FollowupAction(
+                    session_id=session.session_id,
+                    ticket_id=ticket.ticket_id,
+                    action_type="sms_followup",
+                    channel="sms",
+                    destination=ticket.customer.phone,
+                    reason="OpenClaw: customer notification",
+                    payload={"suggested_message": followup.message},
+                )
+                self.repository.save_followup_action(action)
+                result = await send_sms(ticket.customer.phone, followup.message, self.settings)
+                self.repository.update_followup_action_status(action.action_id, "sent" if result.sent else "pending")
+                logger.info("Customer SMS: %s status=%s", action.action_id, "sent" if result.sent else "pending")
+
+        # Fallback: if no structured followups but owner notifications enabled, still notify
+        if not parsed.followups and self.settings.owner_phone and self.settings.owner_notifications_enabled:
+            review_tag = " [REVIEW]" if parsed.human_review_needed else ""
+            owner_msg = f"New{review_tag}: {ticket.customer.name} - {ticket.request.service} at {ticket.request.preferred_time}"[:160]
+            action = FollowupAction(
+                session_id=session.session_id,
+                ticket_id=ticket.ticket_id,
+                action_type="notify_owner",
+                channel="sms",
+                destination=self.settings.owner_phone,
+                reason="Fallback owner notification",
+                payload={"suggested_message": owner_msg},
+            )
+            self.repository.save_followup_action(action)
+            result = await send_sms(self.settings.owner_phone, owner_msg, self.settings)
+            self.repository.update_followup_action_status(action.action_id, "sent" if result.sent else "pending")
+
+        # If human review flagged, create review queue item
+        if parsed.human_review_needed:
+            review_item = ReviewItem(
+                ticket_id=ticket.ticket_id,
+                session_id=session.session_id,
+                reason=parsed.review_reason or f"OpenClaw: {parsed.summary[:200]}",
+                openclaw_summary=parsed.summary,
+                openclaw_next_step=parsed.next_step,
+            )
+            self.repository.save_review_item(review_item)
+            logger.info("Created review item: %s reason=%s", review_item.review_id, parsed.review_reason or parsed.action)
+
+        session.transcript.append(
+            ConversationMessage(
+                role="system",
+                content=f"OpenClaw [{parsed.action}]: {parsed.summary} | Review: {parsed.human_review_needed}",
+            )
+        )
+        session.touch()
+        self.repository.save_session(session)
 
     async def handle_voice_inbound(self, payload: dict[str, Any]) -> dict[str, Any]:
         from_number = normalize_phone(payload.get("From"))
+        logger.info("Voice inbound from %s", from_number or "unknown")
         session = self.repository.find_latest_session_by_phone(from_number) if from_number else None
         if not session or session.submitted_to_openclaw:
             session = self.start_session(phone=from_number, channel="phone")
@@ -187,7 +321,45 @@ class IntakeService:
             "say": contract.next_prompt,
             "prompt_id": contract.prompt_id,
             "play_audio_id": contract.play_audio_id,
-            "gather": True,
+        }
+
+    async def handle_voice_gather(self, payload: dict[str, Any]) -> dict[str, Any]:
+        call_sid = payload.get("CallSid")
+        speech_result = (payload.get("SpeechResult") or "").strip()
+        logger.info("Voice gather: CallSid=%s speech=%s", call_sid, speech_result[:80] if speech_result else "(empty)")
+
+        session_id = self.repository.find_session_id_by_external_id(call_sid) if call_sid else None
+        if not session_id:
+            logger.warning("Voice gather: no session for CallSid=%s", call_sid)
+            return {"say": "Sorry, I lost track of our conversation. Please call back.", "hangup": True}
+
+        if not speech_result:
+            # Twilio timed out waiting for speech — repeat the prompt
+            session = self.get_session_or_404(session_id)
+            contract = self.build_contract(session)
+            return {
+                "session_id": session_id,
+                "say": f"I didn't catch that. {contract.next_prompt}",
+                "timeout_say": "I still didn't hear anything. We'll send you a text to continue. Goodbye.",
+            }
+
+        session = await self.process_turn(session_id, speech_result)
+
+        # Auto-submit for voice callers when they confirm
+        if session.state == SessionState.SUBMITTED and not session.submitted_to_openclaw:
+            logger.info("Voice auto-submit for session %s", session_id)
+            session, _ = await self.submit_session(session_id)
+            return {
+                "session_id": session_id,
+                "say": "Your request has been submitted. We'll text you with updates. Goodbye.",
+                "hangup": True,
+            }
+
+        contract = self.build_contract(session)
+        return {
+            "session_id": session_id,
+            "say": contract.next_prompt,
+            "prompt_id": contract.prompt_id,
         }
 
     async def handle_voice_status(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -206,6 +378,7 @@ class IntakeService:
         )
         created_action = None
         if session and call_status in {"no-answer", "busy", "failed", "canceled"}:
+            logger.warning("Missed call: session=%s status=%s", session_id, call_status)
             created_action = self._create_missed_call_followup(
                 session=session,
                 reason=f"Missed call status: {call_status}",
@@ -221,6 +394,7 @@ class IntakeService:
     async def handle_sms_inbound(self, payload: dict[str, Any]) -> dict[str, Any]:
         from_number = normalize_phone(payload.get("From"))
         body = (payload.get("Body") or "").strip()
+        logger.info("SMS inbound from %s: %s", from_number or "unknown", body[:80])
         session = self.repository.find_latest_session_by_phone(from_number) if from_number else None
         if not session or session.submitted_to_openclaw:
             session = self.start_session(phone=from_number, channel="sms")
@@ -236,6 +410,19 @@ class IntakeService:
         )
         if body:
             session = await self.process_turn(session.session_id, body)
+
+        # Auto-submit for SMS when customer confirms
+        if session.state == SessionState.SUBMITTED and not session.submitted_to_openclaw:
+            logger.info("SMS auto-submit for session %s", session.session_id)
+            session, _ = await self.submit_session(session.session_id)
+            return {
+                "session_id": session.session_id,
+                "reply": "Your request has been submitted! We'll text you with updates shortly.",
+                "prompt_id": "submitted_ready_01",
+                "state": session.state.value,
+                "allow_submit": False,
+            }
+
         contract = self.build_contract(session)
         return {
             "session_id": session.session_id,
@@ -315,12 +502,75 @@ class IntakeService:
         self.repository.save_session(session)
         return action
 
+    async def execute_followup_action(self, action_id: str) -> dict[str, Any]:
+        """Execute a single followup action (send SMS)."""
+        from .sms_sender import send_sms
+
+        action = self.repository.get_followup_action(action_id)
+        if not action:
+            raise HTTPException(status_code=404, detail="Followup action not found")
+        if action.status != "pending":
+            return {"action_id": action_id, "status": action.status, "skipped": True, "reason": "not pending"}
+
+        if action.action_type == "sms_followup" and action.destination:
+            message = action.payload.get("suggested_message", "We have an update on your request.")
+            result = await send_sms(action.destination, message, self.settings)
+            new_status = "sent" if result.sent else "failed"
+            self.repository.update_followup_action_status(action_id, new_status)
+            logger.info("Followup %s executed: status=%s sms_sid=%s", action_id, new_status, result.sid)
+            return {"action_id": action_id, "status": new_status, "sms_sid": result.sid, "error": result.error}
+
+        logger.warning("Followup %s: unsupported type=%s or no destination", action_id, action.action_type)
+        return {"action_id": action_id, "status": "skipped", "reason": f"unsupported: {action.action_type}"}
+
+    async def execute_pending_followups(self) -> list[dict[str, Any]]:
+        """Execute all pending followup actions."""
+        pending = self.repository.list_pending_followup_actions()
+        logger.info("Executing %d pending followup actions", len(pending))
+        results = []
+        for action in pending:
+            result = await self.execute_followup_action(action.action_id)
+            results.append(result)
+        return results
+
     def _local_ticket_status_for_state(self, state: SessionState) -> str:
         if state == SessionState.SUBMITTED:
             return "confirmed"
         if state == SessionState.CONFIRMATION:
             return "ready_for_confirmation"
         return "draft"
+
+    def _apply_llm_fields(self, session: IntakeSession, candidates: CandidateFields) -> None:
+        """Apply LLM-extracted fields to ticket after validation. Only sets fields that are currently empty."""
+        updates = candidates.as_update_dict()
+        for field, value in updates.items():
+            if field == "phone":
+                continue  # phone always from regex
+            cleaned = self._validate_field(field, value)
+            if cleaned is None:
+                logger.debug("LLM field rejected: %s=%r", field, value)
+                continue
+            if field == "customer_name" and not session.ticket.customer.name:
+                session.ticket.customer.name = cleaned
+            elif field == "service" and not session.ticket.request.service:
+                session.ticket.request.service = cleaned
+            elif field == "preferred_time" and not session.ticket.request.preferred_time:
+                session.ticket.request.preferred_time = cleaned
+            elif field == "notes" and session.ticket.request.notes is None:
+                session.ticket.request.notes = cleaned
+
+    def _sanitize_llm_reply(self, reply: str, session: IntakeSession) -> str | None:
+        """Return the LLM reply if it passes safety checks, otherwise None to trigger fallback."""
+        if not reply or len(reply) < 5 or len(reply) > 500:
+            logger.warning("LLM reply rejected: length=%d", len(reply) if reply else 0)
+            return None
+        lowered = reply.lower()
+        bad_phrases = {"submitted", "confirmed your request", "ticket is complete", "request is complete", "all done"}
+        for phrase in bad_phrases:
+            if phrase in lowered:
+                logger.warning("LLM reply rejected: contains '%s'", phrase)
+                return None
+        return reply
 
 
 def normalize_phone(value: str | None) -> str | None:

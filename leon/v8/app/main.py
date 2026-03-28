@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
@@ -10,12 +11,17 @@ from fastapi.responses import FileResponse, RedirectResponse, Response
 
 from .config import Settings, get_settings
 from .database import SessionRepository, get_connection, init_db
+
+logger = logging.getLogger("intake")
 from .models import (
+    BookingSummary,
     ConversationContract,
     HealthResponse,
     PromptSpec,
     ProposeTicketRequest,
     ProposeTicketResponse,
+    ResolveReviewRequest,
+    ReviewItemSummary,
     StartSessionRequest,
     StartSessionResponse,
     SubmitSessionResponse,
@@ -33,6 +39,16 @@ from .state_machine import PROMPT_LIBRARY
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+    logger.info("Starting %s (env=%s)", settings.app_name, settings.app_env)
+    logger.info("Database: %s", settings.database_path)
+    logger.info("OpenClaw: enabled=%s url=%s agent=%s", settings.openclaw_enabled, settings.openclaw_hook_url, settings.openclaw_agent_id)
+    logger.info("LLM: active=%s model=%s", settings.llm_active, settings.gemini_model)
+    logger.info("Twilio: enabled=%s from=%s", settings.twilio_enabled, settings.twilio_from_number or "not set")
+    logger.info("Vapi: enabled=%s assistant=%s", settings.vapi_enabled, settings.vapi_assistant_id or "not set")
     conn = get_connection(settings.database_path)
     init_db(conn)
     app.state.db_conn = conn
@@ -179,15 +195,144 @@ def list_followup_actions(repository: RepoDep, limit: int = 50) -> list[dict[str
     return [action.model_dump(mode="json") for action in repository.list_followup_actions(limit=limit)]
 
 
+@app.post("/followup-actions/{action_id}/execute")
+async def execute_followup_action(action_id: str, service: ServiceDep) -> dict[str, Any]:
+    return await service.execute_followup_action(action_id)
+
+
+@app.post("/followup-actions/execute-pending")
+async def execute_pending_followups(service: ServiceDep) -> list[dict[str, Any]]:
+    return await service.execute_pending_followups()
+
+
+# ── Review queue ──
+
+
+@app.get("/reviews", response_model=list[ReviewItemSummary])
+def list_reviews(repository: RepoDep, status: str | None = None, limit: int = 50) -> list[ReviewItemSummary]:
+    return repository.list_reviews(status=status, limit=limit)
+
+
+@app.get("/reviews/{review_id}")
+def get_review(review_id: str, repository: RepoDep) -> dict[str, Any]:
+    from fastapi import HTTPException
+
+    item = repository.get_review_item(review_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Review not found")
+    # Include full ticket detail
+    ticket_detail = repository.get_ticket_detail(item.ticket_id)
+    return {
+        "review": item.model_dump(mode="json"),
+        "ticket": ticket_detail.model_dump(mode="json") if ticket_detail else None,
+    }
+
+
+@app.post("/reviews/{review_id}/resolve")
+def resolve_review(review_id: str, body: ResolveReviewRequest, repository: RepoDep) -> dict[str, Any]:
+    from fastapi import HTTPException
+
+    success = repository.resolve_review(review_id, body.resolved_by, body.resolution_notes)
+    if not success:
+        raise HTTPException(status_code=404, detail="Review not found or already resolved")
+    return {"review_id": review_id, "status": "resolved", "resolved_by": body.resolved_by}
+
+
+# ── Bookings ──
+
+
+@app.get("/bookings", response_model=list[BookingSummary])
+def list_bookings(repository: RepoDep, date: str | None = None, limit: int = 50) -> list[BookingSummary]:
+    if date:
+        return repository.list_bookings_for_date(date)
+    return repository.list_bookings(limit=limit)
+
+
+@app.get("/bookings/availability")
+def check_booking_availability(date: str, repository: RepoDep) -> dict[str, Any]:
+    from .calendar import check_availability
+    return check_availability(repository, date)
+
+
+@app.post("/bookings/{booking_id}/cancel")
+def cancel_booking(booking_id: str, repository: RepoDep) -> dict[str, Any]:
+    from fastapi import HTTPException
+    success = repository.cancel_booking(booking_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    return {"booking_id": booking_id, "status": "cancelled"}
+
+
+# ── Owner chat (OpenClaw) ──
+
+
+@app.post("/owner/chat")
+async def owner_chat(request: Request, settings: SettingsDep) -> dict[str, Any]:
+    import asyncio
+    import json as json_mod
+
+    body = await request.json()
+    message = body.get("message", "")
+    if not message:
+        return {"reply": "Please type a message."}
+    if not settings.openclaw_enabled:
+        return {"reply": "OpenClaw is not enabled."}
+
+    try:
+        cmd = [
+            "openclaw", "agent",
+            "--agent", "main",
+            "--json",
+            "--timeout", "30",
+            "--session-id", "leon-owner-dashboard",
+            "--message", message,
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=35)
+        if proc.returncode != 0:
+            return {"reply": "OpenClaw didn't respond. Try again."}
+        data = json_mod.loads(stdout.decode())
+        text = data.get("result", {}).get("payloads", [{}])[0].get("text", "No response.")
+        # Strip thinking blocks that Gemini sometimes includes
+        import re as re_mod
+        text = re_mod.sub(r'^think\b.*?(?=\n[A-Z]|\n\n)', '', text, flags=re_mod.DOTALL).strip()
+        # Also strip "Thinking Process:" blocks
+        if 'Thinking Process:' in text:
+            parts = re_mod.split(r'(?:Thinking Process:.*?)(?=\n[A-Z*#])', text, flags=re_mod.DOTALL)
+            text = parts[-1].strip() if parts else text
+        return {"reply": text}
+    except Exception as exc:
+        return {"reply": f"Error: {exc}"}
+
+
+# ── Vapi webhook ──
+
+
+@app.post("/webhooks/vapi")
+async def vapi_webhook(request: Request, service: ServiceDep, settings: SettingsDep) -> dict[str, Any]:
+    from .vapi_webhook import handle_vapi_event
+
+    payload = await request.json()
+    return await handle_vapi_event(payload, service, settings)
+
+
+# ── Twilio webhooks ──
+
+
 @app.post("/webhooks/twilio/voice/inbound", include_in_schema=True)
 async def twilio_voice_inbound(request: Request, service: ServiceDep) -> Response:
     payload = await _read_form_or_json(request)
     result = await service.handle_voice_inbound(payload)
-    xml = (
-        "<?xml version='1.0' encoding='UTF-8'?>"
-        f"<Response><Say>{_xml_escape(result['say'])}</Say><Pause length='1'/></Response>"
-    )
-    return Response(content=xml, media_type="application/xml")
+    return Response(content=_voice_twiml(result), media_type="application/xml")
+
+
+@app.post("/webhooks/twilio/voice/gather", include_in_schema=True)
+async def twilio_voice_gather(request: Request, service: ServiceDep) -> Response:
+    payload = await _read_form_or_json(request)
+    result = await service.handle_voice_gather(payload)
+    return Response(content=_voice_twiml(result), media_type="application/xml")
 
 
 @app.post("/webhooks/twilio/voice/status")
@@ -213,6 +358,22 @@ async def _read_form_or_json(request: Request) -> dict[str, Any]:
         return await request.json()
     form = await request.form()
     return dict(form)
+
+
+def _voice_twiml(result: dict[str, Any]) -> str:
+    say = _xml_escape(result["say"])
+    if result.get("hangup"):
+        return f"<?xml version='1.0' encoding='UTF-8'?><Response><Say>{say}</Say><Hangup/></Response>"
+    return (
+        "<?xml version='1.0' encoding='UTF-8'?>"
+        "<Response>"
+        "<Gather input='speech' timeout='6' speechTimeout='auto' "
+        "action='/webhooks/twilio/voice/gather' method='POST'>"
+        f"<Say>{say}</Say>"
+        "</Gather>"
+        f"<Say>{_xml_escape(result.get('timeout_say', 'I did not hear anything. Goodbye.'))}</Say>"
+        "</Response>"
+    )
 
 
 def _xml_escape(text: str) -> str:

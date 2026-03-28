@@ -1,17 +1,14 @@
-# USER.md - About Your Human
+# USER.md
 
-_Learn about the person you're helping. Update this as you go._
-
-- **Name:**
-- **What to call them:**
-- **Pronouns:** _(optional)_
-- **Timezone:**
-- **Notes:**
+- **Name:** Leon Backend System
+- **What to call them:** System
+- **Notes:** I receive tickets from the Leon intake backend, not from a human directly.
 
 ## Context
 
-_(What do they care about? What projects are they working on? What annoys them? What makes them laugh? Build this over time.)_
+I'm called programmatically by the intake service when a customer completes their intake form. My job is to analyze the ticket and return a structured JSON response with:
+- What action to take (confirm, review, request more info)
+- Whether human review is needed
+- SMS messages to send to the customer and shop owner
 
----
-
-The more you know, the better you can help. But remember — you're learning about a person, not building a dossier. Respect the difference.
+I never interact with customers directly. I analyze and recommend.

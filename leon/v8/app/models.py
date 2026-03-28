@@ -257,3 +257,62 @@ class OpenClawSubmissionResult(BaseModel):
     submitted: bool
     payload: dict
     response: Optional[dict] = None
+
+
+class ReviewItem(BaseModel):
+    review_id: str = Field(default_factory=lambda: f"rev_{uuid4().hex[:10]}")
+    ticket_id: str
+    session_id: str
+    reason: str
+    status: str = "pending"
+    openclaw_summary: Optional[str] = None
+    openclaw_next_step: Optional[str] = None
+    resolved_by: Optional[str] = None
+    resolution_notes: Optional[str] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class ReviewItemSummary(BaseModel):
+    review_id: str
+    ticket_id: str
+    session_id: str
+    customer_name: Optional[str] = None
+    service: Optional[str] = None
+    reason: str
+    status: str
+    openclaw_summary: Optional[str] = None
+    created_at: datetime | str
+    updated_at: datetime | str
+
+
+class ResolveReviewRequest(BaseModel):
+    resolved_by: str = "owner"
+    resolution_notes: Optional[str] = None
+
+
+class Booking(BaseModel):
+    booking_id: str = Field(default_factory=lambda: f"bk_{uuid4().hex[:10]}")
+    ticket_id: str
+    session_id: str
+    customer_name: Optional[str] = None
+    customer_phone: Optional[str] = None
+    service: str
+    booking_date: str  # YYYY-MM-DD
+    booking_time: Optional[str] = None  # HH:MM or descriptive
+    duration_minutes: int = 60
+    status: str = "confirmed"
+    notes: Optional[str] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class BookingSummary(BaseModel):
+    booking_id: str
+    ticket_id: str
+    customer_name: Optional[str] = None
+    service: str
+    booking_date: str
+    booking_time: Optional[str] = None
+    status: str
+    created_at: datetime | str
